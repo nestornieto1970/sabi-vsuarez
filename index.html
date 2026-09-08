@@ -1115,17 +1115,21 @@ const LAST_BAT={};
 const BAT2EQ={};Object.entries(LAST_BAT).forEach(([eq,b])=>{BAT2EQ[b]=eq;});
 // Pool de cada equipo y de cada batería (se llenan desde la base). Sirven para
 // que al escoger un equipo solo se ofrezcan baterías de su mismo pool.
-const EQ_POOL={}, BAT_POOL={};
+const EQ_POOL={}, BAT_POOL={}, EQ_LOC={}, BAT_LOC={};
 function poolDelEquipo(eq){ return EQ_POOL[eq] || null; }
-// Baterías compatibles con el equipo seleccionado (mismo pool), excluyendo una.
+// Baterías compatibles con el equipo seleccionado: mismo POOL y misma LOCALIDAD
+// que el equipo (las baterías están fijas a su localidad). Excluye una batería.
 function batinList(excluir){
   const pool = poolDelEquipo(cS.equipo);
+  const loc  = EQ_LOC[cS.equipo] || null;
   let lista = BATTERIES.filter(b=> b!==excluir);
-  if(pool){
-    const mismas = lista.filter(b=> BAT_POOL[b]===pool);
-    // Si por alguna razón no hay ninguna del pool, mostramos todas (no bloquear el cambio).
-    if(mismas.length) return mismas;
-  }
+  let filtradas = lista;
+  if(pool) filtradas = filtradas.filter(b=> BAT_POOL[b]===pool);
+  if(loc)  filtradas = filtradas.filter(b=> BAT_LOC[b]===loc);
+  if(filtradas.length) return filtradas;
+  // Respaldo (datos incompletos): no bloquear el cambio.
+  if(loc){ const l = lista.filter(b=> BAT_LOC[b]===loc); if(l.length) return l; }
+  if(pool){ const p = lista.filter(b=> BAT_POOL[b]===pool); if(p.length) return p; }
   return lista;
 }
 let cS={equipo:'',batOut:'',batOutOk:false,batIn:'',hourmeter:'',water:'',wash:'',operator:'',notes:''};
@@ -2037,9 +2041,9 @@ function sessionLocalidad(){ return (sessionOperatorObj && sessionOperatorObj.lo
 function locFilter(){ const l=sessionLocalidad(); return l ? '&localidad=eq.'+encodeURIComponent(l) : ''; }
 
 async function loadEquipos(){
-  const data = await supaFetch('/rest/v1/equipment_list?deleted=not.is.true'+locFilter()+'&select=equipment_id,battery_pool');
+  const data = await supaFetch('/rest/v1/equipment_list?deleted=not.is.true'+locFilter()+'&select=equipment_id,battery_pool,localidad');
   if(data && data.length){
-    data.forEach(r=>{ if(r.equipment_id) EQ_POOL[r.equipment_id] = r.battery_pool || null; });
+    data.forEach(r=>{ if(r.equipment_id){ EQ_POOL[r.equipment_id] = r.battery_pool || null; EQ_LOC[r.equipment_id] = r.localidad || null; } });
     const ids = data.map(r=>r.equipment_id).filter(Boolean);
     ids.sort((a,b)=>{
       const pa=a.replace(/[0-9].*/,''), pb=b.replace(/[0-9].*/,'');
@@ -2048,15 +2052,25 @@ async function loadEquipos(){
     });
     EQUIPOS.length = 0;
     ids.forEach(id => EQUIPOS.push(id));
-    populateSel('c-equipo-sel', EQUIPOS, '— Seleccionar equipo —');
+    // Poblar el select mostrando la localidad al lado del equipo (valor = solo el ID)
+    const sel = document.getElementById('c-equipo-sel');
+    if(sel){
+      sel.innerHTML = '<option value="">— Seleccionar equipo —</option>';
+      EQUIPOS.forEach(id => {
+        const o = document.createElement('option');
+        o.value = id;
+        o.textContent = EQ_LOC[id] ? (id + '  ·  ' + EQ_LOC[id]) : id;
+        sel.appendChild(o);
+      });
+    }
     console.log('Equipment loaded from DB:', EQUIPOS.length);
   }
 }
 
 async function loadBatteries(){
-  const data = await supaFetch('/rest/v1/battery_list?deleted=not.is.true'+locFilter()+'&select=battery_id,battery_pool');
+  const data = await supaFetch('/rest/v1/battery_list?deleted=not.is.true'+locFilter()+'&select=battery_id,battery_pool,localidad');
   if(data && data.length){
-    data.forEach(r=>{ if(r.battery_id) BAT_POOL[r.battery_id] = r.battery_pool || null; });
+    data.forEach(r=>{ if(r.battery_id){ BAT_POOL[r.battery_id] = r.battery_pool || null; BAT_LOC[r.battery_id] = r.localidad || null; } });
     const ids = data.map(r=>r.battery_id).filter(Boolean);
     ids.sort((a,b)=>(parseInt(a.replace(/\D/g,''))||0)-(parseInt(b.replace(/\D/g,''))||0));
     BATTERIES.length = 0;
