@@ -2658,5 +2658,164 @@ function resetInventario(){
 }
 
 </script>
+
+<!-- ================================================================= -->
+<!-- SABI · PARCHE DE GUARDADO OFFLINE (cola de sincronización)          -->
+<!-- Pega TODO este bloque justo ANTES de la etiqueta </body>           -->
+<!-- (al final del archivo index.html). No borres nada más.             -->
+<!-- ================================================================= -->
+<script>
+(function(){
+  // ---- Cola guardada en el iPad (sobrevive aunque se cierre la app) ----
+  var QKEY = 'sabi_offline_queue_v1';
+  function loadQueue(){ try{ return JSON.parse(localStorage.getItem(QKEY)) || []; }catch(e){ return []; } }
+  function saveQueue(q){ try{ localStorage.setItem(QKEY, JSON.stringify(q)); }catch(e){} }
+
+  function enqueueWrite(path, method, body, prefer){
+    var q = loadQueue();
+    q.push({ path:path, method:method, body:body, prefer: prefer || 'return=minimal', ts: Date.now(), attempts:0 });
+    saveQueue(q);
+    updateSyncBadge();
+  }
+
+  // ---- Indicador visual en el encabezado ----
+  function updateSyncBadge(){
+    var b = document.getElementById('sync-badge');
+    if(!b){
+      b = document.createElement('div');
+      b.id = 'sync-badge';
+      b.style.cssText = 'font-family:var(--mono);font-size:10px;border-radius:20px;padding:3px 10px;white-space:nowrap;display:none';
+      var hr = document.querySelector('.header-right');
+      if(hr) hr.insertBefore(b, hr.firstChild);
+    }
+    var n = loadQueue().length;
+    if(n > 0){
+      b.style.display = 'block';
+      b.textContent = '⏳ ' + n + ' por subir';
+      b.style.background = 'var(--warning-dim)'; b.style.color = 'var(--warning)'; b.style.border = '1px solid var(--warning)';
+    } else if(navigator.onLine === false){
+      b.style.display = 'block';
+      b.textContent = '📴 Sin conexión';
+      b.style.background = 'var(--surface2)'; b.style.color = 'var(--text-muted)'; b.style.border = '1px solid var(--border)';
+    } else {
+      b.style.display = 'none';
+    }
+  }
+
+  // ---- Sube la cola pendiente cuando hay internet ----
+  var flushing = false;
+  async function flushQueue(){
+    if(flushing) return;
+    var q = loadQueue();
+    if(!q.length){ updateSyncBadge(); return; }
+    flushing = true;
+    var subidos = 0;
+    while(q.length){
+      var item = q[0];
+      try{
+        var headers = {
+          'apikey': SUPA_KEY,
+          'Authorization': 'Bearer ' + SUPA_KEY,
+          'Content-Type': 'application/json',
+          'Prefer': item.prefer || 'return=minimal'
+        };
+        var res = await fetch(SUPA_URL + item.path, {
+          method: item.method,
+          headers: headers,
+          body: item.body != null ? JSON.stringify(item.body) : undefined
+        });
+        if(res.ok){
+          q.shift(); saveQueue(q); subidos++;
+        } else {
+          // El servidor respondió con error (no es falta de internet)
+          item.attempts = (item.attempts || 0) + 1;
+          if(item.attempts >= 5){ console.warn('Descartando registro tras 5 intentos:', item); q.shift(); saveQueue(q); }
+          else { saveQueue(q); break; }
+        }
+      } catch(e){
+        // Sin internet: paramos y reintentamos luego (no se pierde nada)
+        break;
+      }
+    }
+    flushing = false;
+    updateSyncBadge();
+    if(subidos > 0 && typeof showToast === 'function'){
+      showToast('✅ ' + subidos + ' registro' + (subidos>1?'s':'') + ' subido' + (subidos>1?'s':'') + ' a la nube');
+    }
+  }
+
+  // ---- Reemplaza supaFetch para que las ESCRITURAS entren a la cola ----
+  supaFetch = async function(path, method, body, prefer){
+    method = method || 'GET';
+    body = (body === undefined) ? null : body;
+    prefer = prefer || null;
+    var isWrite = method !== 'GET';
+    var opts = {
+      method: method,
+      headers: {
+        'apikey': SUPA_KEY,
+        'Authorization': 'Bearer ' + SUPA_KEY,
+        'Content-Type': 'application/json',
+        'Prefer': prefer || (method === 'POST' ? 'return=minimal' : '')
+      }
+    };
+    if(body) opts.body = JSON.stringify(body);
+    try {
+      var res = await fetch(SUPA_URL + path, opts);
+      if(!res.ok){ var err = await res.text(); console.error('Supabase error:', err); return null; }
+      if(method === 'GET') return await res.json();
+      flushQueue(); // aprovecha para vaciar lo pendiente
+      return true;
+    } catch(e){
+      console.error('Network error:', e);
+      if(isWrite){ enqueueWrite(path, method, body, prefer); return 'QUEUED'; }
+      return null; // los GET no se pueden encolar
+    }
+  };
+
+  // ---- Estado de batería: un solo upsert (arregla el doble guardado) ----
+  updateBatteryStatus = async function(batteryId, status, equipmentId){
+    if(equipmentId === undefined) equipmentId = null;
+    var body = { battery_id: batteryId, status: status, equipment_id: equipmentId, updated_at: new Date().toISOString() };
+    return await supaFetch('/rest/v1/battery_status', 'POST', body, 'resolution=merge-duplicates');
+  };
+
+  // ---- Contador de equalización: si no hay internet, no lo corrompe ----
+  incrementExtractionCount = async function(batteryId){
+    if(!batteryId) return false;
+    var data = await supaFetch('/rest/v1/battery_list?battery_id=eq.' + batteryId + '&select=extraction_count');
+    if(data === null) return false; // sin internet o error: se omite este conteo
+    var current = (data[0] && data[0].extraction_count) ? data[0].extraction_count : 0;
+    var next = current + 1;
+    var needsEqualizing = false;
+    if(next >= 5){ next = 0; needsEqualizing = true; }
+    await supaFetch('/rest/v1/battery_list?battery_id=eq.' + batteryId, 'PATCH', { extraction_count: next });
+    if(needsEqualizing){
+      await supaFetch('/rest/v1/battery_status', 'POST',
+        { battery_id: batteryId, status: 'requiere_equalizacion', equipment_id: null, updated_at: new Date().toISOString() },
+        'resolution=merge-duplicates');
+    }
+    return needsEqualizing;
+  };
+
+  // ---- Mensaje correcto al guardar (nube vs pendiente) ----
+  saveEvent = async function(record){
+    var result = await supaFetch('/rest/v1/battery_events', 'POST', record);
+    if(typeof showToast === 'function'){
+      if(result === 'QUEUED') showToast('⏳ Sin internet — se subirá al reconectar');
+      else if(result) showToast('✓ Guardado en la nube');
+      else showToast('⚠️ Error al guardar');
+    }
+    return result;
+  };
+
+  // ---- Reintentos automáticos ----
+  window.addEventListener('online',  function(){ updateSyncBadge(); flushQueue(); });
+  window.addEventListener('offline', updateSyncBadge);
+  setInterval(flushQueue, 20000); // cada 20 segundos por si acaso
+  window.addEventListener('DOMContentLoaded', function(){ updateSyncBadge(); flushQueue(); });
+})();
+</script>
+
 </body>
 </html>
